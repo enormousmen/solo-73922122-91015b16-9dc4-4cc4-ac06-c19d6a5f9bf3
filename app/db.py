@@ -18,11 +18,23 @@ passed is swept to ``released_at = <now>, release_reason = 'expired'`` at
 the start of each write transaction.  That keeps the partial unique indexes
 ("one active lease per address", "one active lease per client") truthful
 without needing a clock-dependent index predicate.
+
+Imports
+-------
+``import_leases`` migrates leases exported from a retired DHCP service.
+Validation runs inside the same ``BEGIN IMMEDIATE`` transaction that writes
+the batch, i.e. against the pool and the active leases as they are the
+moment the batch can be written.  The receipt is stored in that transaction
+too, so a batch is either fully imported with its receipt on disk or not
+present at all.  Re-submitting the batch id with the same entry list
+returns the stored receipt; the same id with a different list is rejected.
 """
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import sqlite3
 import time
 import uuid
@@ -44,14 +56,15 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS leases (
-    lease_id       TEXT PRIMARY KEY,
-    client_id      TEXT NOT NULL,
-    ip             TEXT NOT NULL,
-    pool_cidr      TEXT NOT NULL,
-    issued_at      REAL NOT NULL,
-    expires_at     REAL NOT NULL,
-    released_at    REAL,
-    release_reason TEXT,
+    lease_id        TEXT PRIMARY KEY,
+    client_id       TEXT NOT NULL,
+    ip              TEXT NOT NULL,
+    pool_cidr       TEXT NOT NULL,
+    issued_at       REAL NOT NULL,
+    expires_at      REAL NOT NULL,
+    released_at     REAL,
+    release_reason  TEXT,
+    import_batch_id TEXT,
     CHECK (released_at IS NULL OR released_at >= issued_at),
     CHECK (expires_at > issued_at),
     CHECK (release_reason IS NULL OR release_reason IN ('released', 'expired'))
@@ -70,17 +83,35 @@ CREATE TABLE IF NOT EXISTS pool_changes (
     new_cidr       TEXT NOT NULL,
     changed_at     REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS import_batches (
+    batch_id      TEXT PRIMARY KEY,
+    manifest_hash TEXT NOT NULL,
+    receipt_json  TEXT NOT NULL,
+    created_at    REAL NOT NULL
+);
 """
 
 
 class LeaseError(Exception):
-    """Domain error carrying an HTTP status and a stable machine code."""
+    """Domain error carrying an HTTP status and a stable machine code.
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    ``details`` is merged into the error envelope, e.g. to list the
+    offending entries of a rejected import batch.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 def iso(epoch: float) -> str:
@@ -97,6 +128,7 @@ class Lease:
     expires_at: float
     released_at: float | None
     release_reason: str | None
+    import_batch_id: str | None = None
 
     def is_active(self, now: float) -> bool:
         return self.released_at is None and self.expires_at > now
@@ -120,6 +152,7 @@ class Lease:
             "expires_at": iso(self.expires_at),
             "released_at": iso(self.released_at) if self.released_at is not None else None,
             "release_reason": self.release_reason,
+            "import_batch_id": self.import_batch_id,
             "seconds_remaining": max(0, int(self.expires_at - now)) if active else 0,
         }
 
@@ -134,7 +167,35 @@ class Lease:
             expires_at=row["expires_at"],
             released_at=row["released_at"],
             release_reason=row["release_reason"],
+            import_batch_id=row["import_batch_id"],
         )
+
+
+@dataclass(frozen=True)
+class ImportItem:
+    """One row of a legacy-DHCP export, validated and normalized upstream.
+
+    ``ip`` is the canonical dotted-quad form and ``expires_at`` is epoch
+    seconds (UTC).
+    """
+
+    client_id: str
+    ip: str
+    expires_at: float
+
+
+def _manifest_hash(items: list[ImportItem]) -> str:
+    """Content hash of an import list, insensitive to entry order.
+
+    Two submissions carry "the same list" when their normalized
+    (client_id, ip, expires_at) triples match; formatting differences in the
+    export do not matter.
+    """
+    canonical = json.dumps(
+        sorted((item.client_id, item.ip, iso(item.expires_at)) for item in items),
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class Store:
@@ -170,12 +231,14 @@ class Store:
         """Create the schema and restore the persisted pool or seed the default.
 
         A restart restores whatever pool was last committed; the environment
-        default only seeds a fresh database.
+        default only seeds a fresh database.  Databases created by older
+        versions are migrated in place.
         """
         conn = self._connect()
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = 'current_pool'"
             ).fetchone()
@@ -188,6 +251,15 @@ class Store:
                 self._pool = subnets.parse_pool_cidr(row["value"])
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring databases written by older versions up to the current schema."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(leases)")
+        }
+        if "import_batch_id" not in columns:
+            conn.execute("ALTER TABLE leases ADD COLUMN import_batch_id TEXT")
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -495,3 +567,198 @@ class Store:
             "changed_at": iso(now),
             **counts,
         }
+
+    def import_leases(
+        self, batch_id: str, items: list[ImportItem]
+    ) -> tuple[dict[str, Any], bool]:
+        """Import leases exported from the retired DHCP service, atomically.
+
+        Validation happens inside the write transaction, i.e. against the
+        pool and the set of active leases as they are the moment the batch
+        can be written.  Entries whose expiry has already passed are skipped
+        and reported, never rejected.  Any other problem — a duplicate
+        client/address inside the batch, an address outside the pool's
+        usable range, or a client/address that already holds an active
+        lease — rejects the whole batch and nothing is persisted, so the
+        operator can fix the export and retry with the same batch id.
+
+        Returns ``(receipt, replayed)``.  Re-submitting the same batch id
+        with the same entry list returns the stored receipt unchanged (even
+        if the leases have since been released or the service restarted);
+        the same id with a different list is a conflict.
+        """
+        now = self.clock()
+        manifest = _manifest_hash(items)
+        with self._write() as conn:
+            self._sweep_expired(conn, now)
+            row = conn.execute(
+                "SELECT manifest_hash, receipt_json FROM import_batches "
+                "WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is not None:
+                if row["manifest_hash"] != manifest:
+                    raise LeaseError(
+                        409,
+                        "import_batch_conflict",
+                        f"batch {batch_id!r} was already imported with a "
+                        "different entry list",
+                    )
+                return json.loads(row["receipt_json"]), True
+
+            pool = self._current_pool(conn)
+
+            skipped: list[dict[str, Any]] = []
+            live: list[tuple[int, ImportItem]] = []
+            for index, item in enumerate(items):
+                if item.expires_at <= now:
+                    skipped.append(
+                        {
+                            "index": index,
+                            "client_id": item.client_id,
+                            "ip": item.ip,
+                            "expires_at": iso(item.expires_at),
+                            "reason": "expired",
+                        }
+                    )
+                else:
+                    live.append((index, item))
+
+            seen_clients: dict[str, int] = {}
+            seen_ips: dict[str, int] = {}
+            duplicates: list[dict[str, Any]] = []
+            for index, item in live:
+                if item.client_id in seen_clients:
+                    duplicates.append(
+                        {
+                            "index": index,
+                            "client_id": item.client_id,
+                            "ip": item.ip,
+                            "reason": "duplicate_client_id",
+                            "first_index": seen_clients[item.client_id],
+                        }
+                    )
+                else:
+                    seen_clients[item.client_id] = index
+                if item.ip in seen_ips:
+                    duplicates.append(
+                        {
+                            "index": index,
+                            "client_id": item.client_id,
+                            "ip": item.ip,
+                            "reason": "duplicate_ip",
+                            "first_index": seen_ips[item.ip],
+                        }
+                    )
+                else:
+                    seen_ips[item.ip] = index
+            if duplicates:
+                raise LeaseError(
+                    422,
+                    "invalid_import",
+                    "the batch lists the same client_id or ip more than once",
+                    details={"entries": duplicates},
+                )
+
+            out_of_pool = [
+                {
+                    "index": index,
+                    "client_id": item.client_id,
+                    "ip": item.ip,
+                    "reason": "address_out_of_pool",
+                    "pool_cidr": str(pool),
+                }
+                for index, item in live
+                if not self._in_pool(pool, item.ip)
+            ]
+            if out_of_pool:
+                raise LeaseError(
+                    422,
+                    "address_out_of_pool",
+                    f"{len(out_of_pool)} address(es) lie outside the usable "
+                    f"range of the current pool {pool}",
+                    details={"entries": out_of_pool},
+                )
+
+            active = conn.execute(
+                "SELECT lease_id, client_id, ip FROM leases "
+                "WHERE released_at IS NULL"
+            ).fetchall()
+            by_client = {row["client_id"]: row for row in active}
+            by_ip = {row["ip"]: row for row in active}
+            conflicts: list[dict[str, Any]] = []
+            for index, item in live:
+                hit = by_client.get(item.client_id)
+                if hit is not None:
+                    conflicts.append(
+                        {
+                            "index": index,
+                            "client_id": item.client_id,
+                            "ip": item.ip,
+                            "reason": "client_has_active_lease",
+                            "lease_id": hit["lease_id"],
+                        }
+                    )
+                hit = by_ip.get(item.ip)
+                if hit is not None:
+                    conflicts.append(
+                        {
+                            "index": index,
+                            "client_id": item.client_id,
+                            "ip": item.ip,
+                            "reason": "address_already_leased",
+                            "lease_id": hit["lease_id"],
+                        }
+                    )
+            if conflicts:
+                raise LeaseError(
+                    409,
+                    "import_conflict",
+                    "client_id or ip already has an active lease",
+                    details={"entries": conflicts},
+                )
+
+            imported: list[dict[str, Any]] = []
+            for _index, item in live:
+                lease_id = uuid.uuid4().hex
+                conn.execute(
+                    """
+                    INSERT INTO leases(lease_id, client_id, ip, pool_cidr,
+                                       issued_at, expires_at, import_batch_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lease_id,
+                        item.client_id,
+                        item.ip,
+                        str(pool),
+                        now,
+                        item.expires_at,
+                        batch_id,
+                    ),
+                )
+                imported.append(
+                    {
+                        "lease_id": lease_id,
+                        "client_id": item.client_id,
+                        "ip": item.ip,
+                        "expires_at": iso(item.expires_at),
+                    }
+                )
+
+            receipt: dict[str, Any] = {
+                "batch_id": batch_id,
+                "pool_cidr": str(pool),
+                "imported_at": iso(now),
+                "imported": imported,
+                "skipped": skipped,
+            }
+            conn.execute(
+                """
+                INSERT INTO import_batches(batch_id, manifest_hash,
+                                           receipt_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (batch_id, manifest, json.dumps(receipt), now),
+            )
+        return receipt, False

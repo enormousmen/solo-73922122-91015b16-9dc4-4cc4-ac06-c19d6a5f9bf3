@@ -44,11 +44,14 @@ Configuration (env vars, see `docker-compose.yml`):
 | `POST` | `/v1/leases/{lease_id}/renew` | Renew an active in-pool lease |
 | `POST` | `/v1/leases/{lease_id}/release` | Release an active lease |
 | `GET` | `/v1/admin/out-of-pool` | Still-occupied addresses outside the pool (operator) |
+| `POST` | `/v1/admin/lease-imports` | Import leases exported from the retired DHCP service (operator) |
 
 Errors are structured: `{"error": {"code": "...", "message": "..."}}` with
 codes such as `pool_exhausted`, `lease_not_found`, `lease_released`,
 `lease_expired`, `address_out_of_pool`, `invalid_pool`, `invalid_ttl`,
-`unauthorized`.
+`invalid_import`, `import_conflict`, `import_batch_conflict`,
+`unauthorized`. Import rejections additionally list the offending rows
+under `error.entries`.
 
 ## Semantics
 
@@ -79,6 +82,29 @@ and `GET /v1/leases/{id}`.
 environment default only seeds a fresh file. Relaunching the container
 restores the pool, all leases and the switch history (`pool_changes`).
 
+**Lease import** (`POST /v1/admin/lease-imports`, operator) migrates leases
+that were still valid when the old DHCP service stopped handing them out.
+The body carries a `batch_id` and the exported `entries`, each with
+`client_id`, `ip` and a UTC `expires_at` (an ISO-8601 timestamp with an
+explicit offset, e.g. `2026-11-21T03:00:00Z`). Validation runs inside the
+write transaction, i.e. against the pool and the active leases as they are
+the moment the batch can be written. Entries whose expiry has already
+passed are skipped and listed under `skipped`; everything else must be
+clean — no duplicate client/address inside the batch, every address inside
+the pool's usable range, and no active lease for the client or the
+address — or the whole batch is rejected (`422 invalid_import` /
+`address_out_of_pool`, `409 import_conflict`) with the offending rows under
+`error.entries` and nothing persisted, so the operator can fix the export
+and retry with the same batch id. On success (`201`) each entry is
+registered with its original expiry, the new lease ids are listed under
+`imported`, and the receipt is stored in the same transaction as the
+leases. The device keeps using its legacy `client_id` and gets its original
+address back from `POST /v1/leases` while the lease is valid. Re-posting
+the same batch id with the same entry list returns the stored receipt
+(`200`, `replayed: true`) even after the leases were released or the
+service restarted; the same id with a different list is
+`409 import_batch_conflict`.
+
 ## Concurrency
 
 Every mutating operation runs in `BEGIN IMMEDIATE`, i.e. under SQLite's
@@ -98,4 +124,6 @@ python3 -m pytest -q
 - `tests/test_store.py` — allocation, idempotency, renew/release rules, expiry,
   pool moves, restart recovery
 - `tests/test_api.py` — HTTP status codes, structured errors, operator auth
+- `tests/test_imports.py` — legacy lease import: validation, atomicity, replay,
+  restart, pool-switch interplay
 - `tests/test_concurrency.py` — switch-vs-operation races and address uniqueness

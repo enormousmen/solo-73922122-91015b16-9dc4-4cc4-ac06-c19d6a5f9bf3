@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from .config import Settings
-from .db import LeaseError, Store
+from .db import ImportItem, LeaseError, Store
 
 DESCRIPTION = """
 Single-subnet IPv4 DHCP-style lease API.
@@ -27,6 +28,11 @@ Single-subnet IPv4 DHCP-style lease API.
   previous pool keeps serving.  The pool and all leases survive restarts.
 * **Operators** (`GET /v1/admin/out-of-pool`) can list still-occupied
   addresses that lie outside the current pool, with their expiry times.
+* **Lease import** (`POST /v1/admin/lease-imports`, operator) migrates leases
+  exported from a retired DHCP service: each entry keeps its original
+  `client_id`, address and UTC expiry.  Already-expired entries are skipped;
+  any other problem rejects the whole batch.  Re-posting the same batch id
+  with the same list returns the stored receipt.
 """
 
 
@@ -55,6 +61,48 @@ class PoolRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cidr: str = Field(min_length=1, max_length=32)
+
+
+def _stripped(value: str, field: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field} must not be blank")
+    return value
+
+
+class ImportEntry(BaseModel):
+    """One lease row exported from the retired DHCP service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(min_length=1, max_length=128)
+    ip: str = Field(min_length=7, max_length=15)
+    expires_at: AwareDatetime  # UTC instant; a naive timestamp is rejected
+
+    @field_validator("client_id")
+    @classmethod
+    def _strip_client_id(cls, value: str) -> str:
+        return _stripped(value, "client_id")
+
+    @field_validator("ip")
+    @classmethod
+    def _normalize_ip(cls, value: str) -> str:
+        try:
+            return str(ipaddress.IPv4Address(value.strip()))
+        except ValueError as exc:
+            raise ValueError("ip must be a dotted-quad IPv4 address") from exc
+
+
+class ImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, max_length=128)
+    entries: list[ImportEntry] = Field(min_length=1, max_length=1000)
+
+    @field_validator("batch_id")
+    @classmethod
+    def _strip_batch_id(cls, value: str) -> str:
+        return _stripped(value, "batch_id")
 
 
 class ErrorBody(BaseModel):
@@ -101,7 +149,10 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 
     @app.exception_handler(LeaseError)
     async def handle_lease_error(_: Request, exc: LeaseError) -> JSONResponse:
-        return error_response(exc.status_code, exc.code, exc.message)
+        body: dict[str, Any] = {"code": exc.code, "message": exc.message}
+        if exc.details:
+            body.update(exc.details)
+        return JSONResponse(status_code=exc.status_code, content={"error": body})
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
@@ -202,6 +253,37 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     ) -> dict[str, Any]:
         leases = store.out_of_pool_leases()
         return {"count": len(leases), "leases": leases}
+
+    @app.post(
+        "/v1/admin/lease-imports",
+        tags=["admin"],
+        summary="Import leases exported from the retired DHCP service (operator)",
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            200: {"description": "Batch already imported; stored receipt returned"},
+            409: {"description": "Batch id reused with a different list, import conflicts with active leases"},
+            422: {"description": "Duplicate or out-of-pool entries; whole batch rejected"},
+        },
+    )
+    def import_leases(
+        body: ImportRequest,
+        response: Response,
+        store: Store = Depends(get_store),
+        _: None = Depends(require_operator),
+    ) -> dict[str, Any]:
+        items = [
+            ImportItem(
+                client_id=entry.client_id,
+                ip=entry.ip,
+                expires_at=entry.expires_at.timestamp(),
+            )
+            for entry in body.entries
+        ]
+        receipt, replayed = store.import_leases(body.batch_id, items)
+        response.status_code = (
+            status.HTTP_200_OK if replayed else status.HTTP_201_CREATED
+        )
+        return {"replayed": replayed, **receipt}
 
     return app
 
